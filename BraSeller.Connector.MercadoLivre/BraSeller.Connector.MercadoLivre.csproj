@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\BraSeller.Connectors.Abstractions\BraSeller.Connectors.Abstractions.csproj" />
+    <PackageReference Include="Microsoft.Extensions.Http" Version="10.*" />
+    <PackageReference Include="Microsoft.Extensions.Options.ConfigurationExtensions" Version="10.*" />
+    <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" Version="10.*" />
+    <PackageReference Include="System.Threading.RateLimiting" Version="10.*" />
+  </ItemGroup>
+  <Target Name="CopyConnectorPlugin" AfterTargets="Build" Condition="'$(DeployAsPlugin)' == 'true' and '$(SkipPluginDeploy)' != 'true'">
+    <PropertyGroup>
+      <PluginDirectory>$(MSBuildThisFileDirectory)..\MudBlazorWebApp1\connectors</PluginDirectory>
+    </PropertyGroup>
+    <MakeDir Directories="$(PluginDirectory)" />
+    <ItemGroup>
+      <PluginFiles Include="$(TargetDir)*.*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(PluginFiles)" DestinationFolder="$(PluginDirectory)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

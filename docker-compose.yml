@@ -1,0 +1,24 @@
+services:
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    container_name: braseller_rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: braseller
+      RABBITMQ_DEFAULT_PASS: braseller_secret
+      RABBITMQ_DEFAULT_VHOST: /
+    ports:
+      - "5672:5672"    # AMQP protocol port
+      - "15672:15672"  # Management Web UI port
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

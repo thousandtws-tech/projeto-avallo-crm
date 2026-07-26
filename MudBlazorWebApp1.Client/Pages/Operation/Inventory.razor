@@ -1,0 +1,109 @@
+@page "/inventory"
+@rendermode InteractiveWebAssembly
+@using System.Globalization
+@inject InventoryService InventoryService
+@inject AuthService Auth
+@inject AppLocalizer Text
+@inject ISnackbar Snackbar
+
+<PageTitle>@Text["Estoque e CMV"] | Nucleo</PageTitle>
+
+<AppShellLayout PageContext="@Text["Estoque e CMV"]">
+<div class="page-container inventory-page">
+    <header class="page-header">
+        <div><MudText Typo="Typo.overline" Color="Color.Primary">@Text["Custo real dos produtos"]</MudText><MudText Typo="Typo.h3">@Text["Estoque e CMV"]</MudText><MudText Typo="Typo.body1">@Text["Entradas por NF-e, custo medio e baixa contabil na entrega."]</MudText></div>
+        @if (CanWrite)
+        {
+            <MudTooltip Text="@Text["Importar nota fiscal de entrada em formato XML"]" Placement="Placement.Bottom">
+                <MudFileUpload T="IBrowserFile" OnFilesChanged="ImportInvoiceAsync" Accept=".xml,application/xml,text/xml" Disabled="@_importing">
+                    <CustomContent>
+                        <MudButton Variant="Variant.Filled"
+                                   Color="Color.Primary"
+                                   StartIcon="@Icons.Material.Filled.UploadFile"
+                                   OnClick="@context.OpenFilePickerAsync">
+                            @(_importing ? Text["Importando XML..."] : Text["Importar NF-e XML"])
+                        </MudButton>
+                    </CustomContent>
+                </MudFileUpload>
+            </MudTooltip>
+        }
+    </header>
+
+    <section class="inventory-metrics">
+        <article class="metric-card"><MudText Typo="Typo.caption">@Text["VALOR EM ESTOQUE"]</MudText><MudText Typo="Typo.h4">@Money(_data.Items.Sum(x => x.InventoryValue))</MudText><MudText Typo="Typo.body2">@Text["Custo medio ponderado"]</MudText></article>
+        <article class="metric-card"><MudText Typo="Typo.caption">@Text["UNIDADES DISPONIVEIS"]</MudText><MudText Typo="Typo.h4">@Quantity(_data.Items.Sum(x => x.QuantityOnHand))</MudText><MudText Typo="Typo.body2">@_data.Items.Length @Text["produtos cadastrados"]</MudText></article>
+        <article class="metric-card"><MudText Typo="Typo.caption">@Text["PENDENCIAS DE CMV"]</MudText><MudText Typo="Typo.h4">@_data.Issues.Length</MudText><MudText Typo="Typo.body2">@Text["SKUs ou saldos para conciliar"]</MudText></article>
+    </section>
+
+    @if (_loading)
+    {
+        <div class="mt-4">
+            <MudSkeleton Width="100%" Height="40px" Class="mb-2" />
+            <MudSkeleton Width="100%" Height="30px" Class="mb-2" />
+            <MudSkeleton Width="100%" Height="30px" Class="mb-2" />
+            <MudSkeleton Width="100%" Height="30px" />
+        </div>
+    }
+    else
+    {
+        @if (_data.Issues.Length > 0)
+        {
+            <section class="panel inventory-issues-panel">
+                <div class="panel-heading"><div><MudText Typo="Typo.h5">@Text["Pendencias de conciliacao"]</MudText><MudText Typo="Typo.body2">@Text["Associe o SKU vendido ao produto recebido pela nota fiscal."]</MudText></div>@if (CanWrite) { <MudTooltip Text="@Text["Recalcular estoque e CMV"]" Placement="Placement.Bottom"><MudButton Variant="Variant.Text" StartIcon="@Icons.Material.Filled.Refresh" Disabled="_reprocessing" OnClick="ReprocessAsync">@Text["Reprocessar"]</MudButton></MudTooltip> }</div>
+                <div class="inventory-issue-list">
+                    @foreach (var issue in _data.Issues)
+                    {
+                        <article class="inventory-issue">
+                            <span class="metric-icon"><MudIcon Icon="@IssueIcon(issue.Type)" /></span>
+                            <div class="inventory-issue-copy"><strong>@issue.ItemName</strong><small>@Text["Pedido"] @issue.OrderId &middot; @issue.Platform &middot; SKU @(issue.ExternalSku ?? Text["nao informado"])</small><span>@IssueLabel(issue.Type)</span></div>
+                            @if (CanWrite && issue.Type == "UnresolvedSku" && !string.IsNullOrWhiteSpace(issue.ExternalSku))
+                            {
+                                <MudSelect T="Guid?" Value="@SelectedItem(issue.Id)" ValueChanged="value => SelectItem(issue.Id, value)" Label="@Text["Produto no estoque"]" Variant="Variant.Outlined" Margin="Margin.Dense" Class="inventory-map-select">
+                                    @foreach (var item in _data.Items) { <MudSelectItem T="Guid?" Value="@((Guid?)item.Id)">@item.Sku &middot; @item.Name</MudSelectItem> }
+                                </MudSelect>
+                                <MudTooltip Text="@Text["Vincular SKU do marketplace ao produto"]" Placement="Placement.Bottom"><MudButton Variant="Variant.Filled" Color="Color.Primary" Size="Size.Small" Disabled="@(SelectedItem(issue.Id) is null || _mappingIssue == issue.Id)" OnClick="() => MapAsync(issue)">@Text["Associar SKU"]</MudButton></MudTooltip>
+                            }
+                        </article>
+                    }
+                </div>
+            </section>
+        }
+
+        <section class="panel entries-panel inventory-stock-panel">
+            <div class="entries-toolbar"><div><MudText Typo="Typo.h5">@Text["Posicao de estoque"]</MudText><MudText Typo="Typo.body2">@Text["Saldo atual e custo medio calculado pelas entradas fiscais."]</MudText></div></div>
+            <MudTable T="InventoryItemModel" Items="_data.Items" Hover Breakpoint="Breakpoint.Sm" Class="entries-table">
+                <HeaderContent><MudTh>@Text["SKU interno"]</MudTh><MudTh>@Text["Produto"]</MudTh><MudTh>@Text["Associacoes"]</MudTh><MudTh Class="text-right">@Text["Quantidade"]</MudTh><MudTh Class="text-right">@Text["Custo medio"]</MudTh><MudTh Class="text-right">@Text["Valor em estoque"]</MudTh></HeaderContent>
+                <RowTemplate><MudTd DataLabel="@Text["SKU interno"]"><code>@context.Sku</code></MudTd><MudTd DataLabel="@Text["Produto"]"><strong>@context.Name</strong></MudTd><MudTd DataLabel="@Text["Associacoes"]">@if (context.Mappings.Length == 0) { <small class="table-secondary">@Text["Sem marketplace"]</small> } else { @foreach (var mapping in context.Mappings) { <span class="inventory-mapping">@mapping.Platform: @mapping.ExternalSku</span> } }</MudTd><MudTd DataLabel="@Text["Quantidade"]" Class="text-right">@Quantity(context.QuantityOnHand)</MudTd><MudTd DataLabel="@Text["Custo medio"]" Class="text-right">@Money(context.AverageUnitCost)</MudTd><MudTd DataLabel="@Text["Valor em estoque"]" Class="text-right money-cell">@Money(context.InventoryValue)</MudTd></RowTemplate>
+                <NoRecordsContent><EmptyReport Icon="@Icons.Material.Outlined.Inventory2" Text="@Text["Importe uma NF-e de fornecedor para iniciar o estoque."]" /></NoRecordsContent>
+            </MudTable>
+        </section>
+
+        <section class="panel entries-panel inventory-invoices-panel">
+            <div class="entries-toolbar"><div><MudText Typo="Typo.h5">@Text["Notas fiscais de entrada"]</MudText><MudText Typo="Typo.body2">@Text["Documentos que formaram o custo e o saldo do estoque."]</MudText></div></div>
+            <MudTable T="SupplierInvoiceModel" Items="_data.Invoices" Dense Hover Breakpoint="Breakpoint.Sm" Class="entries-table"><HeaderContent><MudTh>@Text["Emissao"]</MudTh><MudTh>@Text["NF-e"]</MudTh><MudTh>@Text["Fornecedor"]</MudTh><MudTh>@Text["Itens"]</MudTh><MudTh Class="text-right">@Text["Total"]</MudTh></HeaderContent><RowTemplate><MudTd DataLabel="@Text["Emissao"]">@context.IssuedAt.ToLocalTime().ToString("d", CultureInfo.CurrentCulture)</MudTd><MudTd DataLabel="@Text["NF-e"]"><strong>@context.InvoiceNumber</strong><small class="table-secondary">Serie @context.Series</small></MudTd><MudTd DataLabel="@Text["Fornecedor"]"><strong>@context.SupplierName</strong><small class="table-secondary">@context.SupplierTaxId</small></MudTd><MudTd DataLabel="@Text["Itens"]">@context.ItemCount</MudTd><MudTd DataLabel="@Text["Total"]" Class="text-right money-cell">@Money(context.Total)</MudTd></RowTemplate><NoRecordsContent><EmptyReport Icon="@Icons.Material.Outlined.Description" Text="@Text["Nenhuma NF-e importada."]" Compact /></NoRecordsContent></MudTable>
+        </section>
+    }
+</div>
+</AppShellLayout>
+
+@code {
+    private InventoryOverviewModel _data = new([], [], []);
+    private readonly Dictionary<Guid, Guid?> _selectedItems = [];
+    private Guid? _mappingIssue;
+    private bool _loading = true;
+    private bool _importing;
+    private bool _reprocessing;
+    private bool CanWrite => Auth.CurrentUser?.Roles.Any(x => x is "Admin" or "Vendedor") == true;
+    protected override Task OnInitializedAsync() =>
+        OperatingSystem.IsBrowser() ? LoadAsync() : Task.CompletedTask;
+    private async Task LoadAsync() { _loading = true; var result = await InventoryService.GetOverviewAsync(); _loading = false; if (result.Succeeded) _data = result.Value!; else Snackbar.Add(result.Error!, Severity.Error); }
+    private async Task ImportInvoiceAsync(InputFileChangeEventArgs args) { _importing = true; var result = await InventoryService.ImportInvoiceAsync(args.File); _importing = false; Snackbar.Add(result.Succeeded ? $"NF-e {result.Value!.InvoiceNumber} importada e estoque atualizado." : result.Error!, result.Succeeded ? Severity.Success : Severity.Error); if (result.Succeeded) await LoadAsync(); }
+    private Guid? SelectedItem(Guid issueId) => _selectedItems.GetValueOrDefault(issueId);
+    private void SelectItem(Guid issueId, Guid? itemId) => _selectedItems[issueId] = itemId;
+    private async Task MapAsync(InventoryIssueModel issue) { if (SelectedItem(issue.Id) is not { } itemId || issue.ExternalSku is null) return; _mappingIssue = issue.Id; var result = await InventoryService.CreateMappingAsync(issue.Platform, issue.ExternalSku, itemId); _mappingIssue = null; Snackbar.Add(result.Succeeded ? "SKU associado e CMV reprocessado." : result.Error!, result.Succeeded ? Severity.Success : Severity.Error); if (result.Succeeded) await LoadAsync(); }
+    private async Task ReprocessAsync() { _reprocessing = true; var result = await InventoryService.ReprocessAsync(); _reprocessing = false; Snackbar.Add(result.Succeeded ? $"{result.Value!.ProcessedItems} itens processados." : result.Error!, result.Succeeded ? Severity.Success : Severity.Error); if (result.Succeeded) await LoadAsync(); }
+    private static string Money(decimal value) => value.ToString("C", CultureInfo.CurrentCulture);
+    private static string Quantity(decimal value) => value.ToString("N4", CultureInfo.CurrentCulture).TrimEnd('0').TrimEnd(',', '.');
+    private static string IssueIcon(string type) => type == "InsufficientStock" ? Icons.Material.Filled.Inventory : Icons.Material.Filled.LinkOff;
+    private string IssueLabel(string type) => type switch { "UnresolvedSku" => Text["SKU sem associacao"], "InsufficientStock" => Text["Saldo insuficiente"], "MissingOriginalCogs" => Text["CMV original nao localizado"], _ => type };
+}

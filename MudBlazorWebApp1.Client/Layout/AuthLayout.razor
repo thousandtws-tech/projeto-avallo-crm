@@ -1,0 +1,105 @@
+@inherits LayoutComponentBase
+@implements IDisposable
+
+<MudThemeProvider Theme="Theme" />
+<MudPopoverProvider />
+<MudDialogProvider />
+<MudSnackbarProvider />
+
+<main class="auth-shell">
+    <section class="auth-story full-image-story">
+        <div class="auth-story-top">
+            <a class="brand brand-light" href="/">
+                <img src="logo.png" alt="Logo" class="sidebar-logo-img" style="filter: brightness(0) invert(1);" />
+            </a>
+        </div>
+
+        <div class="auth-carousel full-carousel">
+            @for (int i = 0; i < _slides.Length; i++)
+            {
+                var slide = _slides[i];
+                var isActive = i == _activeSlide;
+                <div class="carousel-slide full-slide @(isActive ? "active" : "")">
+                    <img src="@slide" alt="Carousel Slide @(i + 1)" class="full-slide-image" />
+                </div>
+            }
+        </div>
+
+        <div class="carousel-dots-floating">
+            @for (int i = 0; i < _slides.Length; i++)
+            {
+                var index = i;
+                <button type="button" class="dot @(index == _activeSlide ? "active" : "")" @onclick="() => SetSlide(index)" aria-label="Slide @(index + 1)"></button>
+            }
+        </div>
+    </section>
+
+    <section class="auth-form-stage">
+        <div class="auth-mobile-brand">
+            <a class="brand" href="/"><img src="logo.png" alt="Logo" class="sidebar-logo-img" /></a>
+        </div>
+        <div class="auth-form-wrap">
+            @Body
+        </div>
+        <MudText Typo="Typo.caption" Class="auth-legal">Ambiente protegido &middot; Nucleo 2026</MudText>
+    </section>
+</main>
+
+@code {
+    private int _activeSlide = 0;
+    private CancellationTokenSource? _cts;
+
+    private readonly string[] _slides =
+    [
+        "slide1_full.jpg",
+        "slide2_full.jpg",
+        "slide3_full.jpg"
+    ];
+
+    protected override void OnInitialized()
+    {
+        if (OperatingSystem.IsBrowser())
+        {
+            _cts = new CancellationTokenSource();
+            _ = StartAutoPlayAsync(_cts.Token);
+        }
+    }
+
+    private async Task StartAutoPlayAsync(CancellationToken token)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+        while (!token.IsCancellationRequested && await timer.WaitForNextTickAsync(token))
+        {
+            _activeSlide = (_activeSlide + 1) % _slides.Length;
+            await InvokeAsync(StateHasChanged);
+        }
+    }
+
+    private void SetSlide(int index)
+    {
+        _activeSlide = index;
+    }
+
+    public void Dispose()
+    {
+        _cts?.Cancel();
+        _cts?.Dispose();
+    }
+
+    private static readonly MudTheme Theme = new()
+    {
+        PaletteLight = new PaletteLight
+        {
+            Primary = "#252525",
+            Secondary = "#666666",
+            Background = "#F3F3F2",
+            Surface = "#FFFFFF",
+            TextPrimary = "#181818",
+            TextSecondary = "#666666"
+        },
+        LayoutProperties = new LayoutProperties
+        {
+            DefaultBorderRadius = "10px"
+        }
+    };
+}

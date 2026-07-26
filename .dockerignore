@@ -1,0 +1,13 @@
+**/bin/
+**/obj/
+.git/
+.idea/
+.vs/
+.vscode/
+Obsidian/
+infrastructure/
+MudBlazorWebApp1.Tests/
+**/*.user
+**/*.pubxml
+**/*.pdb
+**/appsettings.Development.json
