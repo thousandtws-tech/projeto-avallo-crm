@@ -27,7 +27,7 @@ public static class InfrastructureServiceCollectionExtensions
 
         // 3. Storage & Cloud Infrastructure
         services.Configure<ObjectStorageOptions>(configuration.GetSection("ObjectStorage"));
-        services.AddScoped<IExpenseStorage, S3ExpenseStorage>();
+        services.AddScoped<IExpenseStorage, BlobExpenseStorage>();
 
         // 4. External Clients & Services
         services.AddHttpClient<BrasilApiCnpjClient>(client =>
@@ -45,10 +45,29 @@ public static class InfrastructureServiceCollectionExtensions
         // 7. RabbitMQ Messaging Infrastructure
         services.AddOptions<Messaging.RabbitMqOptions>()
             .BindConfiguration(Messaging.RabbitMqOptions.SectionName)
+            .PostConfigure(options =>
+            {
+                var railwayUrl =
+                    configuration["RABBITMQ_URL"] ??
+                    configuration["RABBITMQ_PRIVATE_URL"] ??
+                    configuration["RABBITMQ_PUBLIC_URL"];
+                if (string.IsNullOrWhiteSpace(options.ConnectionString) &&
+                    !string.IsNullOrWhiteSpace(railwayUrl))
+                {
+                    options.ConnectionString = railwayUrl;
+                    if (string.IsNullOrWhiteSpace(configuration["RabbitMQ__Enabled"]))
+                        options.Enabled = true;
+                }
+            })
             .ValidateDataAnnotations()
+            .Validate(options => !options.Enabled ||
+                !string.IsNullOrWhiteSpace(options.ConnectionString) ||
+                (!string.IsNullOrWhiteSpace(options.HostName) &&
+                 !string.IsNullOrWhiteSpace(options.UserName) &&
+                 !string.IsNullOrWhiteSpace(options.Password)),
+                "RabbitMQ requires RABBITMQ_URL (recommended on Railway) or host credentials.")
             .ValidateOnStart();
         services.AddSingleton<Messaging.IRabbitMqPublisher, Messaging.RabbitMqPublisher>();
-        services.AddHostedService<Messaging.RabbitMqTopologyInitializer>();
         services.AddHostedService<Messaging.Consumers.EmailConsumerWorker>();
         services.AddHostedService<Messaging.Consumers.OrderProcessingConsumerWorker>();
         services.AddHostedService<Messaging.Consumers.AsyncTaskConsumerWorker>();
