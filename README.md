@@ -1,10 +1,24 @@
-# MudBlazorWebApp1
+# Avallo
 
 Base de autenticacao multi-tenant em .NET 10 e PostgreSQL 18.
 
+## Aviso de deploy em tempo real
+
+O endpoint administrativo `POST /api/system/deployment-notice` transmite pelo
+SignalR um aviso global com contagem regressiva. O script abaixo avisa os
+clientes, aguarda o prazo e somente depois atualiza o Azure Container App:
+
+```powershell
+$env:BRASSELLER_ADMIN_TOKEN = '<jwt-admin>'
+.\scripts\deploy-azure.ps1 -Version '20260729.7'
+```
+
+Componentes que precisam persistir rascunhos antes da recarga podem escutar o
+evento JavaScript `nucleo:deployment`.
+
 ## Arquitetura
 
-O BraSeller evolui como um monolito modular: fatias verticais por capacidade de
+O Avallo evolui como um monolito modular: fatias verticais por capacidade de
 negocio, dependencias orientadas para o dominio e workers assincronos para cargas
 longas ou sujeitas a picos. A comparacao das alternativas, regras de dependencia,
 estrutura-alvo e gatilhos para extracao de servicos estao em
@@ -19,19 +33,156 @@ estrutura-alvo e gatilhos para extracao de servicos estao em
 - Rotacao de refresh token e deteccao de reutilizacao, com cookie `HttpOnly`, `Secure` e `SameSite=Strict`.
 - Tenant obtido exclusivamente da claim assinada `tenant_id`; o cliente nunca escolhe o tenant de uma consulta.
 - Filtro global para toda entidade que implementa `ITenantEntity` e bloqueio adicional de escrita no `SaveChanges`.
+- **Row Level Security no PostgreSQL** em todas as 31 tabelas com `TenantId`, como segunda camada independente da aplicacao.
 - `Admin` gerencia usuarios e revisoes contabeis, `Admin` e `Vendedor` podem escrever, `Contador` usa somente endpoints de leitura e download.
 
 O cadastro inicial cria um tenant e seu usuario `Admin`. O endpoint administrativo de usuarios permite criar acessos `Vendedor` ou `Contador` dentro do mesmo tenant.
 
-## Configuracao local
+### Isolamento por tenant no banco (RLS)
 
-1. Inicie o Docker Desktop.
-2. Copie os valores de `.env.example` para um `.env` local e troque a senha.
-3. Execute `docker compose up -d --wait`.
-4. Ajuste a connection string de desenvolvimento caso tenha trocado os valores do PostgreSQL.
-5. Execute `dotnet run --project MudBlazorWebApp1`.
+Os filtros globais do EF Core protegem o que passa pelo `AppDbContext`. A RLS protege o resto:
+SQL cru, script de manutencao, job externo ou uma consulta que esqueca o filtro. Sao duas
+camadas independentes, e a de baixo nao depende de ninguem lembrar de nada.
 
-Em desenvolvimento, as migrations sao aplicadas automaticamente. Em producao, use um job de deploy com `dotnet ef database update` e mantenha `Database__ApplyMigrations=false`.
+Cada tabela com `TenantId` tem a policy `tenant_isolation`, que compara a coluna com a
+variavel de sessao `app.tenant_id`. O `TenantRlsConnectionInterceptor` publica essa variavel
+a cada abertura de conexao. Sem tenant no contexto a variavel vai vazia e nenhuma linha casa:
+o padrao e negar.
+
+**A aplicacao precisa conectar com um role que nao seja dono do schema.** O dono ignora as
+policies — se a app conectar como `postgres`, a RLS fica inerte. Dai a separacao:
+
+| Conexao | Credencial | Para que |
+|---|---|---|
+| `ConnectionStrings:DefaultConnection` | `Avallo_app` | Runtime. Sem DDL, sujeita as policies. |
+| `ConnectionStrings:MigrationConnection` | dono do schema (`postgres`) | Migrations e DDL. Ignora as policies, como deve. |
+
+Local, o `setup-local.ps1` ja cria o role. Manualmente:
+
+```powershell
+Get-Content scripts/sql/create-app-role.sql -Raw |
+  docker exec -i avallo-postgres psql -U postgres -d Avallo -v app_password='Avallo_app' -f -
+```
+
+Em producao, rode o mesmo script uma vez com uma senha forte e defina os dois segredos:
+
+```text
+ConnectionStrings__DefaultConnection    -> Username=Avallo_app
+ConnectionStrings__MigrationConnection  -> credencial dona do schema
+```
+
+Enquanto `MigrationConnection` nao existir, migrations caem na conexao padrao (comportamento
+anterior). Enquanto a aplicacao continuar conectando como dona, a RLS fica inerte e a protecao
+segue sendo so a do EF — **a migration nao quebra nada, mas tambem nao protege nada ate a
+credencial ser trocada.**
+
+`AspNetUsers` e `RefreshTokens` ficam fora da RLS de proposito: sao consultadas no login e no
+refresh, antes de existir um tenant conhecido. Continuam cobertas pelos filtros do EF, e o
+refresh token e protegido pela propria entropia de 512 bits. `Tenants` tambem fica fora, por
+nao ter `TenantId` e ser usada na descoberta de tenants pelos workers.
+
+Para conferir que a RLS esta valendo de fato:
+
+```sql
+-- como Avallo_app, sem tenant definido: deve retornar 0
+SELECT count(*) FROM "FinancialEntries";
+
+-- com um tenant: deve retornar apenas os lancamentos dele
+SELECT set_config('app.tenant_id', '<uuid-do-tenant>', false);
+SELECT count(*) FROM "FinancialEntries";
+```
+
+Se a primeira consulta retornar linhas, a aplicacao esta conectando como dona do schema.
+
+## Executar localmente
+
+### Pre-requisitos
+
+- .NET SDK 10
+- Docker Desktop com Docker Compose
+- PowerShell 7 ou Windows PowerShell
+
+O ambiente local usa PostgreSQL na porta `5432` e Azurite (emulador do Azure Blob Storage) nas portas `10000`, `10001` e `10002`. Os dados ficam em volumes Docker e sobrevivem a reinicializacoes.
+
+Com o Docker Desktop aberto, prepare todo o ambiente:
+
+```powershell
+.\scripts\setup-local.ps1
+```
+
+Para preparar e iniciar tudo em um único comando:
+
+```powershell
+.\scripts\dev.ps1 -TrustHttpsCertificate
+```
+
+Durante o desenvolvimento, use o modo watch:
+
+```powershell
+.\scripts\dev.ps1 -Watch
+```
+
+Para recriar o banco e o storage locais, removendo os volumes Docker:
+
+```powershell
+.\scripts\dev.ps1 -ResetData -TrustHttpsCertificate
+```
+
+Na primeira execucao HTTPS, confie no certificado local caso o navegador apresente um aviso:
+
+```powershell
+dotnet dev-certs https --trust
+```
+
+### Iniciar a aplicacao
+
+Use o inicializador seguro abaixo. Ele verifica as portas antes de iniciar e evita abrir duas instancias simultaneas:
+
+```powershell
+.\scripts\run-local.ps1
+```
+
+O script aceita `-Profile http|https`, `-Watch` e `-NoBuild`. Para parar os
+serviços sem apagar dados, use `.\scripts\stop-local.ps1`; para remover também
+os volumes, use `.\scripts\stop-local.ps1 -RemoveData`.
+
+O comando .NET executado pelo script e:
+
+```powershell
+dotnet run --project Avallo.Web --launch-profile https
+```
+
+Acesse `https://localhost:7128`. O Swagger fica em `https://localhost:7128/swagger`.
+
+Para encerrar, pressione `Ctrl+C` no mesmo terminal antes de iniciar uma nova instancia. Isso libera as portas `7128` e `5152` e evita o erro `address already in use`.
+
+As migrations sao aplicadas automaticamente em `Development`. O contêiner `uploads` do Azurite tambem e criado no startup e armazena notas fiscais, comprovantes e o key ring do Data Protection. Os perfis `http` e `https` fixam banco e storage locais, impedindo que um user-secret antigo direcione o F5 para recursos de producao. Google, Mercado Livre, Shopee e SMTP sao opcionais: a aplicacao inicia normalmente sem essas credenciais.
+
+Comandos uteis:
+
+```powershell
+# Ver os servicos locais
+docker compose -f compose.local.yml ps
+
+# Parar sem apagar os dados
+docker compose -f compose.local.yml stop
+
+# Iniciar novamente
+docker compose -f compose.local.yml start
+
+# Acompanhar os logs
+docker compose -f compose.local.yml logs -f
+```
+
+Para usar outro PostgreSQL ou storage, execute sem launch profile e sobrescreva os valores com user-secrets, sem alterar arquivos versionados:
+
+```powershell
+dotnet user-secrets set "ConnectionStrings:DefaultConnection" "Host=localhost;Port=5432;Database=Avallo;Username=postgres;Password=SUA_SENHA" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "ObjectStorage:ConnectionString" "SUA_CONNECTION_STRING" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet run --project Avallo.Web --no-launch-profile
+```
+
+Em producao, use um job de deploy com `dotnet ef database update` e mantenha `Database__ApplyMigrations=false`.
 
 Segredos de producao devem ser definidos pelo provedor de secrets:
 
@@ -58,13 +209,45 @@ No Google Cloud Console, configure a URI autorizada de redirecionamento como `ht
 
 Para `/api/users`, informe `role` como `Vendedor` ou `Contador`. Endpoints de escrita de dados do negocio devem exigir a policy `CanWrite`; endpoints de leitura devem exigir `TenantMember`.
 
+## Assistente Azure AI
+
+O assistente conversacional fica disponível em `/assistant` e usa o Azure AI
+somente para respostas de conversa. Nesta primeira versão ele não possui
+ferramentas, não executa alterações e não acessa o banco diretamente.
+
+Configure o endpoint e o deployment do modelo por user-secrets no ambiente local:
+
+```powershell
+az login
+dotnet user-secrets set "AzureAI:Endpoint" "https://SEU-RECURSO.services.ai.azure.com/openai/v1" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "AzureAI:Deployment" "Phi-4-mini-instruct" --project "Avallo.Web/Avallo.Web.csproj"
+```
+
+Ou configure o endpoint e o deployment usando o login do Azure CLI:
+
+```powershell
+.\scripts\configure-ai-local.ps1
+```
+
+Em produção, configure a identidade gerenciada do Container App com permissão
+de inferência no projeto/modelo e use:
+
+```text
+AzureAI__Endpoint
+AzureAI__Deployment
+```
+
+O endpoint `POST /api/ai/chat` exige autenticação e mantém o isolamento pelo
+tenant do JWT. O token é obtido pelo `DefaultAzureCredential` e nunca é enviado
+ao navegador.
+
 O administrador gerencia esses acessos em `/users`. Novos usuarios recebem uma senha temporaria e nao podem acessar os modulos do tenant antes de substitui-la no primeiro login. Ao desativar um acesso, JWTs sao invalidados pelo security stamp e refresh tokens ativos sao revogados.
 
 ## Validacao
 
 ```powershell
-dotnet build MudBlazorWebApp1.slnx -c Release
-dotnet test MudBlazorWebApp1.slnx
+dotnet build Avallo.Web.slnx -c Release
+dotnet test Avallo.Web.slnx
 ```
 
 ## Exportacao de relatorios
@@ -76,6 +259,8 @@ O endpoint `GET /api/reports/export` usa os mesmos filtros tenant-aware do paine
 - `from`, `to`, `platform`, `paymentMethod` e `status`
 
 O PDF inclui resumo mensal e layout para conferencia contabil. O Excel inclui uma aba consolidada e uma aba para cada marketplace. O CSV usa UTF-8 com BOM, separador `;` e valores monetarios em formato decimal invariavel.
+
+Toda renderizacao passa por `IReportExportEngine`. Modulos de negocio devem montar um documento tipado e delegar a geracao ao motor; nao devem referenciar QuestPDF, ClosedXML ou implementar serializacao CSV diretamente. O fechamento mensal tambem utiliza essa fronteira para produzir seu PDF contabil imutavel.
 
 O projeto configura `Reports:QuestPdfLicense` como `Community`. Antes de uso comercial, confirme a elegibilidade nos termos do QuestPDF ou altere essa configuracao para a licenca adquirida.
 
@@ -98,19 +283,54 @@ Email__Security=StartTls
 
 Valores aceitos para `Email__Security` incluem `StartTls`, `SslOnConnect` e `None`. Mantenha `StartTls` ou `SslOnConnect` em producao. Com o envio desabilitado, notificacoes e e-mails continuam na outbox e nao sao perdidos.
 
+O worker de notificacoes exige `Notifications__Worker__Enabled=true` e
+`AzureCommunicationEmail__Enabled=true`; caso contrario, permanece ocioso. Novos
+anexos de e-mail sao gravados no Azure Blob Storage quando `ObjectStorage__Enabled`
+esta ativo, e linhas antigas com `AttachmentContent` continuam compativeis.
+
+Para escalar workers, execute varias replicas da aplicacao: o processamento da
+outbox usa leases no PostgreSQL e a sincronizacao de marketplace usa leases por
+conexao e mensagens do Azure Service Bus. Ajuste `Notifications__Worker__BatchSize`
+e `IntervalMinutes` conforme a vazao; para marketplace, use `MaxConcurrentCalls`
+no codigo do processor e o controle de concorrencia/retentativa do Service Bus.
+Mantenha uma unica fila compartilhada e monitore idade da outbox, mensagens
+dead-letter e expiracao de leases.
+
 ## SDK de conectores
 
-`BraSeller.Connectors.Abstractions` e o unico projeto que um modulo de marketplace deve referenciar. O Core nao possui referencia para Mercado Livre, Shopee, Amazon ou qualquer implementacao concreta.
+`Avallo.Connectors.Abstractions` e o unico projeto que um modulo de marketplace deve referenciar. O Core nao possui referencia para Mercado Livre, Shopee, Amazon ou qualquer implementacao concreta.
 
 Um plugin deve implementar:
 
 - `IMarketplaceConnector` com autenticacao, refresh, pedidos, detalhes, pagamentos, taxas, NF opcional, sincronizacao e status.
 - `IConnectorModule` para registrar o conector e suas dependencias no DI.
 - `ConnectorDescriptor.CredentialFields` para a interface montar o formulario sem conhecer a plataforma.
+- `ConnectorDescriptor.Presentation` com tagline, logo, textos de banner, cores e som. E o que permite a interface renderizar um marketplace que ela nao conhece.
+- `ConnectorDescriptor.IsConfigured` e `ConfigurationHint`, calculados a partir das options do proprio plugin. A tela mostra o conector como pendente e explica o que falta, sem nenhuma regra por plataforma.
 
-Publique o plugin, nomeado como `BraSeller.Connector.{Marketplace}.dll`, e suas dependencias na pasta configurada em `Connectors:PluginPath`, por padrao `MudBlazorWebApp1/connectors`. No proximo startup, o loader isolado descobre o modulo automaticamente. Nao adicione `ProjectReference` do plugin ao Core.
+O plugin, nomeado como `Avallo.Connector.{Marketplace}.dll`, e publicado na pasta configurada em `Connectors:PluginPath`, por padrao `Avallo.Web/connectors`. No startup, o loader isolado descobre o modulo automaticamente.
 
-Todos os pedidos devem retornar `StandardOrder`. Na API, o contrato usa `order_id`, `platform`, `date`, `gross_value`, `platform_fee`, `net_value`, `payment_method`, `payment_date`, `release_date`, `status`, `buyer_name`, `items` e `invoice_number`. Status sao serializados como `paid`, `pending` ou `cancelled`.
+Para um projeto novo no repositorio, basta declarar `<IsConnectorPlugin>true</IsConnectorPlugin>`: o alvo `PublishConnectorPlugin` em `Directory.Build.targets` copia o DLL, o pdb e o deps.json para a pasta a cada build. O `Avallo.Web.csproj` referencia os conectores apenas com `ReferenceOutputAssembly="false"`, o que garante ordem de build sem trazer nenhum tipo concreto de marketplace para o assembly do Core. **Nao adicione um `ProjectReference` normal do plugin ao Core** — o teste `Core_assembly_has_no_compile_time_dependency_on_any_marketplace` falha se isso acontecer.
+
+Somente o assembly do plugin vai para a pasta. Contrato, DI, configuracao e demais pacotes que o Core ja possui sao resolvidos a partir do host: duplica-los na pasta quebraria a identidade de tipo e o modulo deixaria de implementar `IConnectorModule`. Se o seu plugin depender de um pacote que o Core nao tem, publique tambem o DLL dessa dependencia.
+
+A pasta `connectors/` e saida de build e esta no `.gitignore`. Se voce tem DLLs antigas versionadas ali, remova-as (`git rm -r --cached Avallo.Web/connectors` e apague a pasta) antes do primeiro build: um plugin compilado contra outra versao de `Avallo.Connectors.Abstractions` faz o startup falhar em `Development` com a mensagem do `ConnectorPluginExtensions`.
+
+Todos os pedidos devem retornar `StandardOrder`. Na API, o contrato usa `order_id`, `platform`, `date`, `gross_value`, `platform_fee`, `net_value`, `payment_method`, `payment_date`, `release_date`, `status`, `buyer_name`, `items`, `invoice_number`, `fulfillment_status` e `delivered_at`. Status sao serializados como `paid`, `pending` ou `cancelled`; `fulfillment_status` como `unknown`, `pending`, `shipped`, `delivered` ou `returned`.
+
+`GetPaymentsAsync` devolve o split financeiro exato, cada vazamento em campo proprio:
+
+| Campo | Natureza contabil |
+|---|---|
+| `gross_value` | Receita — valor bruto pago pelo cliente |
+| `platform_fee` | Despesa de venda — comissao do marketplace |
+| `payment_fee` | Despesa financeira — taxa de gateway/cartao |
+| `shipping_cost` | Despesa comercial — frete retido do seller |
+| `net_value` | Valor liquido liberado para repasse |
+
+`split_residual` e calculado (`gross - platform - payment - shipping - net`) e deve fechar em zero quando a plataforma informa todos os campos; diferente de zero indica taxa nao mapeada pelo conector.
+
+Esse split e o que a **plataforma declara**, guardado por pagamento para conciliacao e auditoria. O **razao contabil nao usa esses campos**: ele e montado a partir de `GetFeesAsync`, que traz cada taxa individualizada com a sua `StandardFeeCategory`. Lancar as duas fontes levaria a contagem dobrada — se voce adicionar um lancamento, adicione em `GetFeesAsync`.
 
 Tokens sao criptografados com ASP.NET Core Data Protection usando finalidades separadas por tenant e conector. Em producao com mais de uma instancia, persista e compartilhe o key ring do Data Protection; perder essas chaves exige reconectar os marketplaces.
 
@@ -126,7 +346,7 @@ Arquivos repetidos sao bloqueados por SHA-256, os originais sao preservados no s
 
 ## Conector Mercado Livre
 
-O plugin `BraSeller.Connector.MercadoLivre` implementa OAuth 2.0, refresh de token, pedidos, detalhes, pagamentos, taxas, status e sincronizacao completa. Datas recebidas em UTC sao normalizadas para `America/Sao_Paulo`. O rate limiter aplica no maximo 100 requisicoes por minuto para cada token, respeitando o limite de 6.000 por hora.
+O plugin `Avallo.Connector.MercadoLivre` implementa OAuth 2.0, refresh de token, pedidos, detalhes, pagamentos, taxas, status e sincronizacao completa. Datas recebidas em UTC sao normalizadas para `America/Sao_Paulo`. O rate limiter aplica no maximo 100 requisicoes por minuto para cada token, respeitando o limite de 6.000 por hora.
 
 Crie um aplicativo em `developers.mercadolivre.com.br` e configure exatamente esta redirect URI no ambiente local:
 
@@ -137,9 +357,30 @@ https://localhost:7128/api/connectors/oauth/callback
 Armazene as credenciais com user-secrets:
 
 ```powershell
-dotnet user-secrets set "Connectors:MercadoLivre:ClientId" "SEU_APP_ID" --project "MudBlazorWebApp1/MudBlazorWebApp1.csproj"
-dotnet user-secrets set "Connectors:MercadoLivre:ClientSecret" "SEU_CLIENT_SECRET" --project "MudBlazorWebApp1/MudBlazorWebApp1.csproj"
-dotnet user-secrets set "Connectors:MercadoLivre:RedirectUri" "https://localhost:7128/api/connectors/oauth/callback" --project "MudBlazorWebApp1/MudBlazorWebApp1.csproj"
+dotnet user-secrets set "Connectors:MercadoLivre:ClientId" "SEU_APP_ID" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "Connectors:MercadoLivre:ClientSecret" "SEU_CLIENT_SECRET" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "Connectors:MercadoLivre:RedirectUri" "https://localhost:7128/api/connectors/oauth/callback" --project "Avallo.Web/Avallo.Web.csproj"
 ```
 
 Depois, acesse `/connectors` e selecione **Conectar** no Mercado Livre. Em producao, troque a redirect URI para o dominio publico HTTPS e configure corretamente os forwarded headers do proxy.
+
+## Conector Shopee
+
+O modulo `Avallo.Connector.Shopee` implementa autorizacao de loja, troca e renovacao de tokens, consulta de loja, pedidos, detalhes, pagamentos, taxas e sincronizacao completa. Todas as chamadas sao assinadas com HMAC-SHA256; o rate limiter local respeita o teto de 1.000 requisicoes por minuto por loja.
+
+Solicite as credenciais de parceiro na Shopee Open Platform e cadastre a callback:
+
+```text
+https://Avallo-web.purplemeadow-42f09588.brazilsouth.azurecontainerapps.io/api/connectors/oauth/callback
+```
+
+Configuracao local, usando primeiro as credenciais e a URL base do sandbox fornecidas pela Shopee:
+
+```powershell
+dotnet user-secrets set "Connectors:Shopee:PartnerId" "SEU_PARTNER_ID" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "Connectors:Shopee:PartnerKey" "SUA_PARTNER_KEY" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "Connectors:Shopee:RedirectUri" "https://localhost:7128/api/connectors/oauth/callback" --project "Avallo.Web/Avallo.Web.csproj"
+dotnet user-secrets set "Connectors:Shopee:BaseUrl" "URL_BASE_DO_SANDBOX" --project "Avallo.Web/Avallo.Web.csproj"
+```
+
+No Azure, use `Connectors__Shopee__PartnerId`, `Connectors__Shopee__PartnerKey`, `Connectors__Shopee__RedirectUri` e `Connectors__Shopee__BaseUrl`. Mantenha `PartnerKey` em um segredo do Container App.

@@ -1,5 +1,6 @@
 **/bin/
 **/obj/
+Avallo.Web/connectors/
 .vs/
 .idea/
 .vscode/
@@ -10,3 +11,4 @@
 **/*.pubxml
 **/*.pdb
 .env
+.local-app.*.log
